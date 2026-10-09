@@ -79,10 +79,11 @@ module fpnew_fma #(
   // wide adder. Preserve the historical placement for smaller configurations.
   localparam int unsigned NUM_PRE_REGS =
       (PipeConfig == fpnew_pkg::DISTRIBUTED && NumPipeRegs >= 4) ? 1 : 0;
-  // FP64's fifth stage separates normalization from rounding/status. Extra
+  // FP32/FP64's fifth stage separates normalization from rounding/status. Extra
   // registers must cut the computation, not just repeat the wide sum register.
   localparam int unsigned NUM_NORM_REGS =
-      (PipeConfig == fpnew_pkg::DISTRIBUTED && FpFormat == fpnew_pkg::FP64 &&
+      (PipeConfig == fpnew_pkg::DISTRIBUTED &&
+       (FpFormat == fpnew_pkg::FP32 || FpFormat == fpnew_pkg::FP64) &&
        NumPipeRegs >= 5) ? 1 : 0;
   localparam int unsigned LEGACY_PIPE_REGS = NumPipeRegs - NUM_PRE_REGS - NUM_NORM_REGS;
   // Pipelines

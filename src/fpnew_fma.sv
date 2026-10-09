@@ -85,7 +85,13 @@ module fpnew_fma #(
       (PipeConfig == fpnew_pkg::DISTRIBUTED &&
        (FpFormat == fpnew_pkg::FP32 || FpFormat == fpnew_pkg::FP64) &&
        NumPipeRegs >= 5) ? 1 : 0;
-  localparam int unsigned LEGACY_PIPE_REGS = NumPipeRegs - NUM_PRE_REGS - NUM_NORM_REGS;
+  // FP64's two extra boundaries cut exponent/control from wide shifts.
+  localparam int unsigned NUM_ALIGN_REGS =
+      (PipeConfig == fpnew_pkg::DISTRIBUTED && FpFormat == fpnew_pkg::FP64 &&
+       NumPipeRegs >= 7) ? 1 : 0;
+  localparam int unsigned NUM_NORM_CTRL_REGS = NUM_ALIGN_REGS;
+  localparam int unsigned LEGACY_PIPE_REGS = NumPipeRegs - NUM_PRE_REGS - NUM_NORM_REGS
+                                            - NUM_ALIGN_REGS - NUM_NORM_CTRL_REGS;
   // Pipelines
   localparam NUM_INP_REGS = PipeConfig == fpnew_pkg::BEFORE
                             ? NumPipeRegs
@@ -362,6 +368,53 @@ module fpnew_fma #(
   logic [3*PRECISION_BITS+3:0] addend_shifted;      // addends are 3p+4 bit wide (including G/R)
   logic                        inject_carry_in;     // inject carry for subtractions if needed
 
+  typedef struct packed {
+    logic [2*PRECISION_BITS-1:0] product;
+    logic [PRECISION_BITS-1:0] mantissa;
+    logic eff_sub;
+    logic sign;
+    logic signed [EXP_WIDTH-1:0] exp_prod;
+    logic signed [EXP_WIDTH-1:0] exp_diff;
+    logic signed [EXP_WIDTH-1:0] tent_exp;
+    logic [SHIFT_AMOUNT_WIDTH-1:0] shamt;
+    fpnew_pkg::roundmode_e rnd;
+    logic special;
+    fp_t special_result;
+    fpnew_pkg::status_t status;
+    TagType tag;
+    logic mask;
+    AuxType aux;
+  } align_payload_t;
+  align_payload_t align_d, align_q;
+  logic align_valid, align_ready;
+  assign align_d.product = product;
+  assign align_d.mantissa = mantissa_c;
+  assign align_d.eff_sub = effective_subtraction;
+  assign align_d.sign = tentative_sign;
+  assign align_d.exp_prod = exponent_product;
+  assign align_d.exp_diff = exponent_difference;
+  assign align_d.tent_exp = tentative_exponent;
+  assign align_d.shamt = addend_shamt;
+  assign align_d.rnd = inp_pipe_rnd_mode_q[NUM_INP_REGS];
+  assign align_d.special = result_is_special;
+  assign align_d.special_result = special_result;
+  assign align_d.status = special_status;
+  assign align_d.tag = inp_pipe_tag_q[NUM_INP_REGS];
+  assign align_d.mask = inp_pipe_mask_q[NUM_INP_REGS];
+  assign align_d.aux = inp_pipe_aux_q[NUM_INP_REGS];
+  if (NUM_ALIGN_REGS != 0) begin : gen_alignment_control_pipeline
+    logic reg_ena;
+    assign align_ready = pre_ready | ~align_valid;
+    assign reg_ena = (align_ready & inp_pipe_valid_q[NUM_INP_REGS]) |
+                     reg_ena_i[NUM_INP_REGS];
+    `FFLARNC(align_valid, inp_pipe_valid_q[NUM_INP_REGS], align_ready,
+             flush_i, 1'b0, clk_i, rst_ni)
+    `FFL(align_q, align_d, reg_ena, '0)
+  end else begin : gen_no_alignment_control_pipeline
+    assign align_q = align_d;
+    assign align_valid = inp_pipe_valid_q[NUM_INP_REGS];
+    assign align_ready = pre_ready;
+  end
   // In parallel, the addend is right-shifted according to the exponent difference. Up to p bits
   // are shifted out and compressed into a sticky bit.
   // BEFORE THE SHIFT:
@@ -371,7 +424,7 @@ module fpnew_fma #(
   // | 000..........000 | mantissa_c | 000...............0GR |  sticky bits  |
   //  <- addend_shamt -> <-    p   -> <- 2p+4-addend_shamt -> <-  up to p  ->
   assign {addend_after_shift, addend_sticky_bits} =
-      (mantissa_c << (3 * PRECISION_BITS + 4)) >> addend_shamt;
+      (align_q.mantissa << (3 * PRECISION_BITS + 4)) >> align_q.shamt;
 
   assign sticky_before_add     = (| addend_sticky_bits);
   // assign addend_after_shift[0] = sticky_before_add;
@@ -399,34 +452,34 @@ module fpnew_fma #(
   pre_payload_t pre_d, pre_q;
   logic pre_valid, pre_ready;
   logic pre_downstream_ready;
-  assign pre_d.product = product;
+  assign pre_d.product = align_q.product;
   assign pre_d.addend = addend_after_shift;
   assign pre_d.sticky = sticky_before_add;
-  assign pre_d.eff_sub = effective_subtraction;
-  assign pre_d.sign = tentative_sign;
-  assign pre_d.exp_prod = exponent_product;
-  assign pre_d.exp_diff = exponent_difference;
-  assign pre_d.tent_exp = tentative_exponent;
-  assign pre_d.shamt = addend_shamt;
-  assign pre_d.rnd = inp_pipe_rnd_mode_q[NUM_INP_REGS];
-  assign pre_d.special = result_is_special;
-  assign pre_d.special_result = special_result;
-  assign pre_d.status = special_status;
-  assign pre_d.tag = inp_pipe_tag_q[NUM_INP_REGS];
-  assign pre_d.mask = inp_pipe_mask_q[NUM_INP_REGS];
-  assign pre_d.aux = inp_pipe_aux_q[NUM_INP_REGS];
+  assign pre_d.eff_sub = align_q.eff_sub;
+  assign pre_d.sign = align_q.sign;
+  assign pre_d.exp_prod = align_q.exp_prod;
+  assign pre_d.exp_diff = align_q.exp_diff;
+  assign pre_d.tent_exp = align_q.tent_exp;
+  assign pre_d.shamt = align_q.shamt;
+  assign pre_d.rnd = align_q.rnd;
+  assign pre_d.special = align_q.special;
+  assign pre_d.special_result = align_q.special_result;
+  assign pre_d.status = align_q.status;
+  assign pre_d.tag = align_q.tag;
+  assign pre_d.mask = align_q.mask;
+  assign pre_d.aux = align_q.aux;
 
   if (NUM_PRE_REGS != 0) begin : gen_pre_adder_pipeline
     logic reg_ena;
     assign pre_ready = pre_downstream_ready | ~pre_valid;
-    assign reg_ena = (pre_ready & inp_pipe_valid_q[NUM_INP_REGS]) |
-                     reg_ena_i[NUM_INP_REGS];
-    `FFLARNC(pre_valid, inp_pipe_valid_q[NUM_INP_REGS], pre_ready,
+    assign reg_ena = (pre_ready & align_valid) |
+                     reg_ena_i[NUM_INP_REGS + NUM_ALIGN_REGS];
+    `FFLARNC(pre_valid, align_valid, pre_ready,
              flush_i, 1'b0, clk_i, rst_ni)
     `FFL(pre_q, pre_d, reg_ena, '0)
   end else begin : gen_no_pre_adder_pipeline
     assign pre_q = pre_d;
-    assign pre_valid = inp_pipe_valid_q[NUM_INP_REGS];
+    assign pre_valid = align_valid;
     assign pre_ready = pre_downstream_ready;
   end
 
@@ -515,7 +568,7 @@ module fpnew_fma #(
   assign mid_pipe_aux_q[0]         = pre_q.aux;
   assign mid_pipe_valid_q[0]       = pre_valid;
   // Input stage: Propagate pipeline ready signal to input pipe
-  assign inp_pipe_ready[NUM_INP_REGS] = pre_ready;
+  assign inp_pipe_ready[NUM_INP_REGS] = align_ready;
   assign pre_downstream_ready = mid_pipe_ready[0];
 
   // Generate the register stages
@@ -529,7 +582,7 @@ module fpnew_fma #(
     // Valid: enabled by ready signal, synchronous clear with the flush signal
     `FFLARNC(mid_pipe_valid_q[i+1], mid_pipe_valid_q[i], mid_pipe_ready[i], flush_i, 1'b0, clk_i, rst_ni)
     // Enable register if pipleine ready and a valid data item is present
-    assign reg_ena = (mid_pipe_ready[i] & mid_pipe_valid_q[i]) | reg_ena_i[NUM_INP_REGS + NUM_PRE_REGS + i];
+    assign reg_ena = (mid_pipe_ready[i] & mid_pipe_valid_q[i]) | reg_ena_i[NUM_INP_REGS + NUM_ALIGN_REGS + NUM_PRE_REGS + i];
     // Generate the pipeline registers within the stages, use enable-registers
     `FFL(mid_pipe_eff_sub_q[i+1],     mid_pipe_eff_sub_q[i],     reg_ena, '0)
     `FFL(mid_pipe_exp_prod_q[i+1],    mid_pipe_exp_prod_q[i],    reg_ena, '0)
@@ -615,27 +668,71 @@ module fpnew_fma #(
     end
   end
 
+  typedef struct packed {
+    logic [3*PRECISION_BITS+4:0] sum;
+    logic [SHIFT_AMOUNT_WIDTH-1:0] shamt;
+    logic signed [EXP_WIDTH-1:0] exponent;
+    logic sign;
+    logic sticky;
+    logic eff_sub;
+    fpnew_pkg::roundmode_e rnd;
+    logic special;
+    fp_t special_result;
+    fpnew_pkg::status_t status;
+    TagType tag;
+    logic mask;
+    AuxType aux;
+  } norm_ctrl_payload_t;
+  norm_ctrl_payload_t norm_ctrl_d, norm_ctrl_q;
+  logic norm_ctrl_valid, norm_ctrl_ready;
+  assign norm_ctrl_d.sum = sum_q;
+  assign norm_ctrl_d.shamt = norm_shamt;
+  assign norm_ctrl_d.exponent = normalized_exponent;
+  assign norm_ctrl_d.sign = final_sign_q;
+  assign norm_ctrl_d.sticky = sticky_before_add_q;
+  assign norm_ctrl_d.eff_sub = effective_subtraction_q;
+  assign norm_ctrl_d.rnd = rnd_mode_q;
+  assign norm_ctrl_d.special = result_is_special_q;
+  assign norm_ctrl_d.special_result = special_result_q;
+  assign norm_ctrl_d.status = special_status_q;
+  assign norm_ctrl_d.tag = mid_pipe_tag_q[NUM_MID_REGS];
+  assign norm_ctrl_d.mask = mid_pipe_mask_q[NUM_MID_REGS];
+  assign norm_ctrl_d.aux = mid_pipe_aux_q[NUM_MID_REGS];
+  if (NUM_NORM_CTRL_REGS != 0) begin : gen_normalization_control_pipeline
+    logic reg_ena;
+    assign norm_ctrl_ready = norm_ready | ~norm_ctrl_valid;
+    assign reg_ena = (norm_ctrl_ready & mid_pipe_valid_q[NUM_MID_REGS]) |
+                     reg_ena_i[NUM_INP_REGS + NUM_ALIGN_REGS + NUM_PRE_REGS + NUM_MID_REGS];
+    `FFLARNC(norm_ctrl_valid, mid_pipe_valid_q[NUM_MID_REGS], norm_ctrl_ready,
+             flush_i, 1'b0, clk_i, rst_ni)
+    `FFL(norm_ctrl_q, norm_ctrl_d, reg_ena, '0)
+  end else begin : gen_no_normalization_control_pipeline
+    assign norm_ctrl_q = norm_ctrl_d;
+    assign norm_ctrl_valid = mid_pipe_valid_q[NUM_MID_REGS];
+    assign norm_ctrl_ready = norm_ready;
+  end
+
   // Do the large normalization shift
-  assign sum_shifted       = sum_q << norm_shamt;
+  assign sum_shifted       = norm_ctrl_q.sum << norm_ctrl_q.shamt;
 
   // The addend-anchored case needs a 1-bit normalization since the leading-one can be to the left
   // or right of the (non-carry) MSB of the sum.
   always_comb begin : small_norm
     // Default assignment, discarding carry bit
     {final_mantissa, sum_sticky_bits} = sum_shifted;
-    final_exponent                    = normalized_exponent;
+    final_exponent                    = norm_ctrl_q.exponent;
 
     // The normalized sum has overflown, align right and fix exponent
     if (sum_shifted[3*PRECISION_BITS+4]) begin // check the carry bit
       {final_mantissa, sum_sticky_bits} = sum_shifted >> 1;
-      final_exponent                    = normalized_exponent + 1;
+      final_exponent                    = norm_ctrl_q.exponent + 1;
     // The normalized sum is normal, nothing to do
     end else if (sum_shifted[3*PRECISION_BITS+3]) begin // check the sum MSB
       // do nothing
     // The normalized sum is still denormal, align left - unless the result is not already subnormal
-    end else if (normalized_exponent > 1) begin
+    end else if (norm_ctrl_q.exponent > 1) begin
       {final_mantissa, sum_sticky_bits} = sum_shifted << 1;
-      final_exponent                    = normalized_exponent - 1;
+      final_exponent                    = norm_ctrl_q.exponent - 1;
     // Otherwise we're denormal
     end else begin
       final_exponent = '0;
@@ -643,7 +740,7 @@ module fpnew_fma #(
   end
 
   // Update the sticky bit with the shifted-out bits
-  assign sticky_after_norm = (| {sum_sticky_bits}) | sticky_before_add_q;
+  assign sticky_after_norm = (| {sum_sticky_bits}) | norm_ctrl_q.sticky;
 
   // Keep the unrounded normalized value and every sideband together. The
   // boundary performs no rounding and preserves the post-rounding UF rule's
@@ -665,31 +762,31 @@ module fpnew_fma #(
   } norm_payload_t;
   norm_payload_t norm_d, norm_q;
   logic norm_valid, norm_ready, norm_downstream_ready;
-  assign norm_d.sign = final_sign_q;
+  assign norm_d.sign = norm_ctrl_q.sign;
   assign norm_d.exponent = final_exponent;
   assign norm_d.mantissa = final_mantissa;
   assign norm_d.sticky = sticky_after_norm;
   assign norm_d.tininess_bit = sum_sticky_bits[MAN_BITS*2 + 4];
-  assign norm_d.eff_sub = effective_subtraction_q;
-  assign norm_d.rnd = rnd_mode_q;
-  assign norm_d.special = result_is_special_q;
-  assign norm_d.special_result = special_result_q;
-  assign norm_d.special_status = special_status_q;
-  assign norm_d.tag = mid_pipe_tag_q[NUM_MID_REGS];
-  assign norm_d.mask = mid_pipe_mask_q[NUM_MID_REGS];
-  assign norm_d.aux = mid_pipe_aux_q[NUM_MID_REGS];
+  assign norm_d.eff_sub = norm_ctrl_q.eff_sub;
+  assign norm_d.rnd = norm_ctrl_q.rnd;
+  assign norm_d.special = norm_ctrl_q.special;
+  assign norm_d.special_result = norm_ctrl_q.special_result;
+  assign norm_d.special_status = norm_ctrl_q.status;
+  assign norm_d.tag = norm_ctrl_q.tag;
+  assign norm_d.mask = norm_ctrl_q.mask;
+  assign norm_d.aux = norm_ctrl_q.aux;
 
   if (NUM_NORM_REGS != 0) begin : gen_normalization_pipeline
     logic reg_ena;
     assign norm_ready = norm_downstream_ready | ~norm_valid;
-    assign reg_ena = (norm_ready & mid_pipe_valid_q[NUM_MID_REGS]) |
-                     reg_ena_i[NUM_INP_REGS + NUM_PRE_REGS + NUM_MID_REGS];
-    `FFLARNC(norm_valid, mid_pipe_valid_q[NUM_MID_REGS], norm_ready,
+    assign reg_ena = (norm_ready & norm_ctrl_valid) |
+                     reg_ena_i[NUM_INP_REGS + NUM_ALIGN_REGS + NUM_PRE_REGS + NUM_MID_REGS + NUM_NORM_CTRL_REGS];
+    `FFLARNC(norm_valid, norm_ctrl_valid, norm_ready,
              flush_i, 1'b0, clk_i, rst_ni)
     `FFL(norm_q, norm_d, reg_ena, '0)
   end else begin : gen_no_normalization_pipeline
     assign norm_q = norm_d;
-    assign norm_valid = mid_pipe_valid_q[NUM_MID_REGS];
+    assign norm_valid = norm_ctrl_valid;
     assign norm_ready = norm_downstream_ready;
   end
 
@@ -786,7 +883,7 @@ module fpnew_fma #(
   assign out_pipe_valid_q[0]  = norm_valid;
   // Input stage: Propagate pipeline ready signal to inside pipe
   assign norm_downstream_ready = out_pipe_ready[0];
-  assign mid_pipe_ready[NUM_MID_REGS] = norm_ready;
+  assign mid_pipe_ready[NUM_MID_REGS] = norm_ctrl_ready;
   // Generate the register stages
   for (genvar i = 0; i < NUM_OUT_REGS; i++) begin : gen_output_pipeline
     // Internal register enable for this stage
@@ -798,7 +895,7 @@ module fpnew_fma #(
     // Valid: enabled by ready signal, synchronous clear with the flush signal
     `FFLARNC(out_pipe_valid_q[i+1], out_pipe_valid_q[i], out_pipe_ready[i], flush_i, 1'b0, clk_i, rst_ni)
     // Enable register if pipleine ready and a valid data item is present
-    assign reg_ena = (out_pipe_ready[i] & out_pipe_valid_q[i]) | reg_ena_i[NUM_INP_REGS + NUM_PRE_REGS + NUM_MID_REGS + NUM_NORM_REGS + i];
+    assign reg_ena = (out_pipe_ready[i] & out_pipe_valid_q[i]) | reg_ena_i[NUM_INP_REGS + NUM_ALIGN_REGS + NUM_PRE_REGS + NUM_MID_REGS + NUM_NORM_CTRL_REGS + NUM_NORM_REGS + i];
     // Generate the pipeline registers within the stages, use enable-registers
     `FFL(out_pipe_result_q[i+1], out_pipe_result_q[i], reg_ena, '0)
     `FFL(out_pipe_status_q[i+1], out_pipe_status_q[i], reg_ena, '0)
@@ -816,7 +913,7 @@ module fpnew_fma #(
   assign mask_o          = out_pipe_mask_q[NUM_OUT_REGS];
   assign aux_o           = out_pipe_aux_q[NUM_OUT_REGS];
   assign out_valid_o     = out_pipe_valid_q[NUM_OUT_REGS];
-  assign busy_o          = (| {inp_pipe_valid_q, pre_valid, mid_pipe_valid_q, norm_valid, out_pipe_valid_q});
+  assign busy_o          = (| {inp_pipe_valid_q, align_valid, pre_valid, mid_pipe_valid_q, norm_ctrl_valid, norm_valid, out_pipe_valid_q});
 
   // Early valid_o signal. This is used for dispatching instructions for dual-issue processor.
   if (NUM_OUT_REGS > 0) begin
@@ -824,7 +921,7 @@ module fpnew_fma #(
                                  out_pipe_valid_q[NUM_OUT_REGS-1]};
   end else if (NUM_NORM_REGS > 0) begin
     assign early_out_valid_o = |{norm_valid & ~norm_downstream_ready,
-                                 mid_pipe_valid_q[NUM_MID_REGS]};
+                                 norm_ctrl_valid};
   end else if (NUM_MID_REGS > 0) begin
     assign early_out_valid_o = |{mid_pipe_valid_q[NUM_MID_REGS] & ~mid_pipe_ready[NUM_MID_REGS],
                                  mid_pipe_valid_q[NUM_MID_REGS-1]};

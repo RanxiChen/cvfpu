@@ -79,7 +79,12 @@ module fpnew_fma #(
   // wide adder. Preserve the historical placement for smaller configurations.
   localparam int unsigned NUM_PRE_REGS =
       (PipeConfig == fpnew_pkg::DISTRIBUTED && NumPipeRegs >= 4) ? 1 : 0;
-  localparam int unsigned LEGACY_PIPE_REGS = NumPipeRegs - NUM_PRE_REGS;
+  // FP64's fifth stage separates normalization from rounding/status. Extra
+  // registers must cut the computation, not just repeat the wide sum register.
+  localparam int unsigned NUM_NORM_REGS =
+      (PipeConfig == fpnew_pkg::DISTRIBUTED && FpFormat == fpnew_pkg::FP64 &&
+       NumPipeRegs >= 5) ? 1 : 0;
+  localparam int unsigned LEGACY_PIPE_REGS = NumPipeRegs - NUM_PRE_REGS - NUM_NORM_REGS;
   // Pipelines
   localparam NUM_INP_REGS = PipeConfig == fpnew_pkg::BEFORE
                             ? NumPipeRegs
@@ -639,6 +644,54 @@ module fpnew_fma #(
   // Update the sticky bit with the shifted-out bits
   assign sticky_after_norm = (| {sum_sticky_bits}) | sticky_before_add_q;
 
+  // Keep the unrounded normalized value and every sideband together. The
+  // boundary performs no rounding and preserves the post-rounding UF rule's
+  // extra sticky-region bit, including the min-normal/subnormal transition.
+  typedef struct packed {
+    logic sign;
+    logic signed [EXP_WIDTH-1:0] exponent;
+    logic [PRECISION_BITS:0] mantissa;
+    logic sticky;
+    logic tininess_bit;
+    logic eff_sub;
+    fpnew_pkg::roundmode_e rnd;
+    logic special;
+    fp_t special_result;
+    fpnew_pkg::status_t special_status;
+    TagType tag;
+    logic mask;
+    AuxType aux;
+  } norm_payload_t;
+  norm_payload_t norm_d, norm_q;
+  logic norm_valid, norm_ready, norm_downstream_ready;
+  assign norm_d.sign = final_sign_q;
+  assign norm_d.exponent = final_exponent;
+  assign norm_d.mantissa = final_mantissa;
+  assign norm_d.sticky = sticky_after_norm;
+  assign norm_d.tininess_bit = sum_sticky_bits[MAN_BITS*2 + 4];
+  assign norm_d.eff_sub = effective_subtraction_q;
+  assign norm_d.rnd = rnd_mode_q;
+  assign norm_d.special = result_is_special_q;
+  assign norm_d.special_result = special_result_q;
+  assign norm_d.special_status = special_status_q;
+  assign norm_d.tag = mid_pipe_tag_q[NUM_MID_REGS];
+  assign norm_d.mask = mid_pipe_mask_q[NUM_MID_REGS];
+  assign norm_d.aux = mid_pipe_aux_q[NUM_MID_REGS];
+
+  if (NUM_NORM_REGS != 0) begin : gen_normalization_pipeline
+    logic reg_ena;
+    assign norm_ready = norm_downstream_ready | ~norm_valid;
+    assign reg_ena = (norm_ready & mid_pipe_valid_q[NUM_MID_REGS]) |
+                     reg_ena_i[NUM_INP_REGS + NUM_PRE_REGS + NUM_MID_REGS];
+    `FFLARNC(norm_valid, mid_pipe_valid_q[NUM_MID_REGS], norm_ready,
+             flush_i, 1'b0, clk_i, rst_ni)
+    `FFL(norm_q, norm_d, reg_ena, '0)
+  end else begin : gen_no_normalization_pipeline
+    assign norm_q = norm_d;
+    assign norm_valid = mid_pipe_valid_q[NUM_MID_REGS];
+    assign norm_ready = norm_downstream_ready;
+  end
+
   // ----------------------------
   // Rounding and classification
   // ----------------------------
@@ -656,17 +709,17 @@ module fpnew_fma #(
   logic [EXP_BITS+MAN_BITS-1:0] rounded_abs; // absolute value of result after rounding
 
   // Classification before round. RISC-V mandates checking underflow AFTER rounding!
-  assign of_before_round = final_exponent >= 2**(EXP_BITS)-1; // infinity exponent is all ones
-  assign uf_before_round = final_exponent == 0;               // exponent for subnormals capped to 0
+  assign of_before_round = norm_q.exponent >= 2**(EXP_BITS)-1; // infinity exponent is all ones
+  assign uf_before_round = norm_q.exponent == 0;               // exponent for subnormals capped to 0
 
   // Assemble result before rounding. In case of overflow, the largest normal value is set.
-  assign pre_round_sign     = final_sign_q;
-  assign pre_round_exponent = (of_before_round) ? 2**EXP_BITS-2 : unsigned'(final_exponent[EXP_BITS-1:0]);
-  assign pre_round_mantissa = (of_before_round) ? '1 : final_mantissa[MAN_BITS:1]; // bit 0 is R bit
+  assign pre_round_sign     = norm_q.sign;
+  assign pre_round_exponent = (of_before_round) ? 2**EXP_BITS-2 : unsigned'(norm_q.exponent[EXP_BITS-1:0]);
+  assign pre_round_mantissa = (of_before_round) ? '1 : norm_q.mantissa[MAN_BITS:1]; // bit 0 is R bit
   assign pre_round_abs      = {pre_round_exponent, pre_round_mantissa};
 
   // In case of overflow, the round and sticky bits are set for proper rounding
-  assign round_sticky_bits  = (of_before_round) ? 2'b11 : {final_mantissa[0], sticky_after_norm};
+  assign round_sticky_bits  = (of_before_round) ? 2'b11 : {norm_q.mantissa[0], norm_q.sticky};
 
   // Perform the rounding
   fpnew_rounding #(
@@ -675,8 +728,8 @@ module fpnew_fma #(
     .abs_value_i             ( pre_round_abs           ),
     .sign_i                  ( pre_round_sign          ),
     .round_sticky_bits_i     ( round_sticky_bits       ),
-    .rnd_mode_i              ( rnd_mode_q              ),
-    .effective_subtraction_i ( effective_subtraction_q ),
+    .rnd_mode_i              ( norm_q.rnd              ),
+    .effective_subtraction_i ( norm_q.eff_sub          ),
     .abs_rounded_o           ( rounded_abs             ),
     .sign_o                  ( rounded_sign            ),
     .exact_zero_o            ( result_zero             )
@@ -685,7 +738,7 @@ module fpnew_fma #(
   // Classification after rounding
   assign uf_after_round = (rounded_abs[EXP_BITS+MAN_BITS-1:MAN_BITS] == '0) // denormal
         || ((pre_round_abs[EXP_BITS+MAN_BITS-1:MAN_BITS] == '0) && (rounded_abs[EXP_BITS+MAN_BITS-1:MAN_BITS] == 1) &&
-           ((round_sticky_bits != 2'b11) || (!sum_sticky_bits[MAN_BITS*2 + 4] && ((rnd_mode_q == fpnew_pkg::RNE) || (rnd_mode_q == fpnew_pkg::RMM)))));
+           ((round_sticky_bits != 2'b11) || (!norm_q.tininess_bit && ((norm_q.rnd == fpnew_pkg::RNE) || (norm_q.rnd == fpnew_pkg::RMM)))));
   assign of_after_round = rounded_abs[EXP_BITS+MAN_BITS-1:MAN_BITS] == '1; // exponent all ones
 
   // -----------------
@@ -707,8 +760,8 @@ module fpnew_fma #(
   fpnew_pkg::status_t status_d;
 
   // Select output depending on special case detection
-  assign result_d = result_is_special_q ? special_result_q : regular_result;
-  assign status_d = result_is_special_q ? special_status_q : regular_status;
+  assign result_d = norm_q.special ? norm_q.special_result : regular_result;
+  assign status_d = norm_q.special ? norm_q.special_status : regular_status;
 
   // ----------------
   // Output Pipeline
@@ -726,12 +779,13 @@ module fpnew_fma #(
   // Input stage: First element of pipeline is taken from inputs
   assign out_pipe_result_q[0] = result_d;
   assign out_pipe_status_q[0] = status_d;
-  assign out_pipe_tag_q[0]    = mid_pipe_tag_q[NUM_MID_REGS];
-  assign out_pipe_mask_q[0]   = mid_pipe_mask_q[NUM_MID_REGS];
-  assign out_pipe_aux_q[0]    = mid_pipe_aux_q[NUM_MID_REGS];
-  assign out_pipe_valid_q[0]  = mid_pipe_valid_q[NUM_MID_REGS];
+  assign out_pipe_tag_q[0]    = norm_q.tag;
+  assign out_pipe_mask_q[0]   = norm_q.mask;
+  assign out_pipe_aux_q[0]    = norm_q.aux;
+  assign out_pipe_valid_q[0]  = norm_valid;
   // Input stage: Propagate pipeline ready signal to inside pipe
-  assign mid_pipe_ready[NUM_MID_REGS] = out_pipe_ready[0];
+  assign norm_downstream_ready = out_pipe_ready[0];
+  assign mid_pipe_ready[NUM_MID_REGS] = norm_ready;
   // Generate the register stages
   for (genvar i = 0; i < NUM_OUT_REGS; i++) begin : gen_output_pipeline
     // Internal register enable for this stage
@@ -743,7 +797,7 @@ module fpnew_fma #(
     // Valid: enabled by ready signal, synchronous clear with the flush signal
     `FFLARNC(out_pipe_valid_q[i+1], out_pipe_valid_q[i], out_pipe_ready[i], flush_i, 1'b0, clk_i, rst_ni)
     // Enable register if pipleine ready and a valid data item is present
-    assign reg_ena = (out_pipe_ready[i] & out_pipe_valid_q[i]) | reg_ena_i[NUM_INP_REGS + NUM_PRE_REGS + NUM_MID_REGS + i];
+    assign reg_ena = (out_pipe_ready[i] & out_pipe_valid_q[i]) | reg_ena_i[NUM_INP_REGS + NUM_PRE_REGS + NUM_MID_REGS + NUM_NORM_REGS + i];
     // Generate the pipeline registers within the stages, use enable-registers
     `FFL(out_pipe_result_q[i+1], out_pipe_result_q[i], reg_ena, '0)
     `FFL(out_pipe_status_q[i+1], out_pipe_status_q[i], reg_ena, '0)
@@ -761,14 +815,17 @@ module fpnew_fma #(
   assign mask_o          = out_pipe_mask_q[NUM_OUT_REGS];
   assign aux_o           = out_pipe_aux_q[NUM_OUT_REGS];
   assign out_valid_o     = out_pipe_valid_q[NUM_OUT_REGS];
-  assign busy_o          = (| {inp_pipe_valid_q, pre_valid, mid_pipe_valid_q, out_pipe_valid_q});
+  assign busy_o          = (| {inp_pipe_valid_q, pre_valid, mid_pipe_valid_q, norm_valid, out_pipe_valid_q});
 
   // Early valid_o signal. This is used for dispatching instructions for dual-issue processor.
   if (NUM_OUT_REGS > 0) begin
     assign early_out_valid_o = |{out_pipe_valid_q[NUM_OUT_REGS] & ~out_pipe_ready[NUM_OUT_REGS],
                                  out_pipe_valid_q[NUM_OUT_REGS-1]};
+  end else if (NUM_NORM_REGS > 0) begin
+    assign early_out_valid_o = |{norm_valid & ~norm_downstream_ready,
+                                 mid_pipe_valid_q[NUM_MID_REGS]};
   end else if (NUM_MID_REGS > 0) begin
-    assign early_out_valid_o = |{mid_pipe_valid_q[NUM_MID_REGS] & ~mid_pipe_ready[NUM_OUT_REGS],
+    assign early_out_valid_o = |{mid_pipe_valid_q[NUM_MID_REGS] & ~mid_pipe_ready[NUM_MID_REGS],
                                  mid_pipe_valid_q[NUM_MID_REGS-1]};
   end else if (NUM_INP_REGS > 0) begin
     assign early_out_valid_o = |{inp_pipe_valid_q[NUM_INP_REGS] & ~inp_pipe_ready[NUM_INP_REGS],

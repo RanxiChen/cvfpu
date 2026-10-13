@@ -341,6 +341,9 @@ module fpnew_divsqrt_th_64_multi #(
   logic op_sel;
   `FFLARNC(op_sel, 1'b1, func_sel, op_sel | flush_i, 1'b0, clk_i, rst_ni)
 
+  // C910 checks NaN-boxing for scalar FP32/FP16 operands even when fpnew's
+  // native WIDTH is narrower than 64. Fill the unused high bits with ones.
+  // At WIDTH=64 this extension is empty and the scalar RV64D path is unchanged.
   ct_vfdsu_top i_ct_vfdsu_top (
     .cp0_vfpu_icg_en                ( 1'b0                      ), // Internal clock gating, (module enable) doesn't matter when the clk_gate module is redundant anyway
     .cp0_yy_clk_en                  ( 1'b1                      ), // Global clock enable (same as above)
@@ -350,8 +353,8 @@ module fpnew_divsqrt_th_64_multi #(
     .dp_vfdsu_ex1_pipex_iid         ( '0                        ), // Don't care, used in C910
     .dp_vfdsu_ex1_pipex_imm0        ( 3'b111                    ), // Round mode, set to 3'b111 to select vfpu_yy_xx_rm signal
     .dp_vfdsu_ex1_pipex_sel         ( op_sel                    ), // 3. Select operands, start operation
-    .dp_vfdsu_ex1_pipex_srcf0       ( {{(64-WIDTH){1'b0}}, srcf0_q} ), // Input for operand 0
-    .dp_vfdsu_ex1_pipex_srcf1       ( {{(64-WIDTH){1'b0}}, srcf1_q} ), // Input for operand 1
+    .dp_vfdsu_ex1_pipex_srcf0       ( {{(64-WIDTH){1'b1}}, srcf0_q} ), // Input for operand 0
+    .dp_vfdsu_ex1_pipex_srcf1       ( {{(64-WIDTH){1'b1}}, srcf1_q} ), // Input for operand 1
     .dp_vfdsu_fdiv_gateclk_issue    ( 1'b1                      ), // Local clock enable (same as above)
     .dp_vfdsu_idu_fdiv_issue        ( op_starting               ), // 1. Issue fdiv (FSM in ctrl)
     .forever_cpuclk                 ( clk_i                     ), // Clock input
